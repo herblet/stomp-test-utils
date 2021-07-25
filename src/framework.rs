@@ -1,9 +1,6 @@
 use std::{convert::TryInto, pin::Pin, time::Duration};
 
-use futures::{
-    future::{join, ready},
-    Future, FutureExt,
-};
+use futures::{future::join, Future, FutureExt};
 use tokio::{
     sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender},
     task::yield_now,
@@ -149,7 +146,7 @@ pub fn send_data<T: TryInto<Vec<u8>>, E: ErrorType + From<T::Error>>(
 }
 
 /// Asserts that the receiver can _immediately_ provide a message which passes
-// the provided predicate. Thus the message must already have been sent by the session being tested.
+// the provided `predicate`. Thus the message must already have been sent by the session being tested.
 pub fn assert_receive<T: FnOnce(Vec<u8>) -> bool>(out_receiver: &mut OutReceiver, predicate: T) {
     let response = out_receiver.recv().now_or_never();
 
@@ -160,11 +157,13 @@ pub fn assert_receive<T: FnOnce(Vec<u8>) -> bool>(out_receiver: &mut OutReceiver
     ));
 }
 
+/// Returns a [`BehaviourFunction`] which will assert that a message is waiting, and that that
+/// message matches the provided `predicate`.
 pub fn receive<E: ErrorType, T: FnOnce(Vec<u8>) -> bool + Send + 'static>(
-    message_matcher: T,
+    predicate: T,
 ) -> impl BehaviourFunction<E> {
     into_behaviour(|_: &mut InSender<E>, out_receiver: &mut OutReceiver| {
-        ready(assert_receive(out_receiver, message_matcher)).boxed()
+        async move { assert_receive(out_receiver, predicate) }.boxed()
     })
 }
 
@@ -585,5 +584,83 @@ mod test {
                 .await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn receive_succeeds_with_message() {
+        let (mut tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let behaviour = receive::<TestError, _>(|bytes| bytes == vec![42u8]);
+
+        out_tx.send(vec![42u8]).expect("Send Failed");
+
+        behaviour(&mut tx, &mut out_rx).await;
+    }
+
+    #[tokio::test]
+    async fn receive_fails_with_incorrect_message() {
+        let (mut tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let behaviour = receive::<TestError, _>(|bytes| bytes == vec![43u8]);
+
+        out_tx.send(vec![42u8]).expect("Send Failed");
+
+        assert_unwind_safe(behaviour(&mut tx, &mut out_rx))
+            .await
+            .expect_err("Behaviour passed");
+    }
+
+    #[tokio::test]
+    async fn sleep_in_pause_passes_time() {
+        let session_factory = |_, sender: OutSender| {
+            async move {
+                tokio::time::sleep(Duration::from_millis(2000)).await;
+                sender.send(vec![1]).expect("Send failed");
+                Ok(())
+            }
+            .boxed()
+        };
+
+        let client_behaviour =
+            into_behaviour::<TestError, _>(|_, out_receiver: &mut OutReceiver| {
+                async move {
+                    assert!(out_receiver.recv().now_or_never().is_none());
+                    sleep_in_pause(3000).await;
+                    assert_receive(out_receiver, |bytes| bytes == vec![1]);
+                }
+                .boxed()
+            });
+
+        assert_beaviour_test_succeeds(session_factory, client_behaviour).await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_fails_if_not_disconnected() {
+        let session_factory = |_, unused: OutSender| {
+            async move {
+                tokio::time::sleep(Duration::from_millis(5060)).await;
+                drop(unused); // disconnects, but too late
+                Ok(())
+            }
+            .boxed()
+        };
+
+        assert_beaviour_test_fails(session_factory, wait_for_disconnect::<TestError>).await;
+    }
+
+    #[tokio::test]
+    async fn wait_for_disconnect_succeeds_if_disconnected() {
+        let session_factory = |_, unused| {
+            async move {
+                tokio::time::sleep(Duration::from_millis(5000)).await;
+                drop(unused); // closes
+                Ok(())
+            }
+            .boxed()
+        };
+
+        assert_beaviour_test_succeeds(session_factory, wait_for_disconnect::<TestError>).await;
     }
 }
