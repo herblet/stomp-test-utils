@@ -1,0 +1,16 @@
+[package]
+name = "stomp-test-utils"
+version = "0.1.0"
+authors = ["Toby Grasl <herblet@knowledge42.com>"]
+edition = "2018"
+description = "Utility classes for testing sessions."
+homepage = "https://github.com/herblet/stomp-test-utils"
+license = "MIT"
+repository = "https://github.com/herblet/stomp-test-utils"
+
+[dependencies]
+tokio = { version = "1", features = ["rt", "sync", "time", "test-util"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros"] }
