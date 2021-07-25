@@ -94,31 +94,17 @@ where
     closure
 }
 
-pub fn send<T: TryInto<Vec<u8>> + Send + 'static, E: ErrorType + From<T::Error>>(
-    data: T,
-) -> impl BehaviourFunction<E> {
-    into_behaviour(move |in_sender: &mut InSender<E>, _: &mut OutReceiver| {
-        send_data(in_sender, data);
-        yield_now().boxed()
-    })
-}
-
-pub fn send_data<T: TryInto<Vec<u8>>, E: ErrorType + From<T::Error>>(
-    in_sender: &InSender<E>,
-    data: T,
-) {
-    in_sender
-        .send(data.try_into().map_err(|e2| e2.into()))
-        .expect("Connect failed");
-}
-
-pub async fn test_expectations<
+/// The core function of this crate, it can be used to test the session returned by `session_factory` by executing
+/// `behaviour` against it - in other words, the [`InSender`] provided to `behaviour` will send messages to the created
+/// session, and the [`OutReceiver`] will receive messages the session sends to its 'counterparty'. Any errors
+/// returned by either side will result in a panic.
+pub async fn assert_behaviour<
     E: ErrorType,
     F: SessionFactory<E>,
     T: BehaviourFunction<E> + 'static,
 >(
     session_factory: F,
-    client_behaviour: T,
+    behaviour: T,
 ) {
     let (in_sender, in_receiver) = unbounded_channel::<Result<Vec<u8>, E>>();
     let (out_sender, out_receiver) = unbounded_channel();
@@ -129,11 +115,9 @@ pub async fn test_expectations<
         let mut out_receiver = out_receiver;
         let mut in_sender = in_sender;
 
-        let result = client_behaviour(&mut in_sender, &mut out_receiver).await;
-        drop(result);
+        behaviour(&mut in_sender, &mut out_receiver).await;
         out_receiver.close();
         drop(in_sender);
-
         ()
     });
 
@@ -143,21 +127,37 @@ pub async fn test_expectations<
     assert!(results.1.is_ok());
 }
 
-pub fn assert_receive<T: FnOnce(Vec<u8>) -> bool>(
-    out_receiver: &mut OutReceiver,
-    message_matcher: T,
+/// Returns a [`BehaviourFuntion`] which sends the provided `data`, and then yields.
+pub fn send<T: TryInto<Vec<u8>> + Send + 'static, E: ErrorType + From<T::Error>>(
+    data: T,
+) -> impl BehaviourFunction<E> {
+    into_behaviour(move |in_sender: &mut InSender<E>, _: &mut OutReceiver| {
+        send_data(in_sender, data);
+        yield_now().boxed()
+    })
+}
+
+/// Sends `data` via `sender`, after converting it to bytes and transforming any error using `from`. Panics
+/// it the send fails.
+pub fn send_data<T: TryInto<Vec<u8>>, E: ErrorType + From<T::Error>>(
+    sender: &InSender<E>,
+    data: T,
 ) {
+    sender
+        .send(data.try_into().map_err(E::from))
+        .expect("Send failed");
+}
+
+/// Asserts that the receiver can _immediately_ provide a message which passes
+// the provided predicate. Thus the message must already have been sent by the session being tested.
+pub fn assert_receive<T: FnOnce(Vec<u8>) -> bool>(out_receiver: &mut OutReceiver, predicate: T) {
     let response = out_receiver.recv().now_or_never();
 
-    if let Some(Some(bytes)) = response {
-        assert!(message_matcher(bytes))
-    } else {
-        if response.is_none() {
-            panic!("No server message");
-        } else {
-            panic!("Unexpected server message:{:?}", response.unwrap());
-        }
-    }
+    assert!(predicate(
+        response
+            .expect("No message from session") // Now or never was 'never'
+            .expect("Session closed") // Message on channel was 'None'
+    ));
 }
 
 pub fn receive<E: ErrorType, T: FnOnce(Vec<u8>) -> bool + Send + 'static>(
@@ -168,6 +168,8 @@ pub fn receive<E: ErrorType, T: FnOnce(Vec<u8>) -> bool + Send + 'static>(
     })
 }
 
+/// Pauses tokio, sleeps for `millis` milliseconds, and then resumes tokio. Allows testing of actions that occur
+/// after some time, such as heartbeats, without actually having to wait for that amount of time.
 pub fn sleep_in_pause(millis: u64) -> impl Future<Output = ()> {
     tokio::time::pause();
     tokio::time::sleep(Duration::from_millis(millis)).inspect(|_| tokio::time::resume())
@@ -189,7 +191,19 @@ pub fn wait_for_disconnect<'a, E: ErrorType>(
 #[cfg(test)]
 mod test {
 
-    use std::convert::Infallible;
+    use std::{
+        any::Any,
+        convert::Infallible,
+        panic::AssertUnwindSafe,
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        },
+    };
+
+    use std::panic;
+
+    use tokio::join;
 
     use super::*;
 
@@ -315,5 +329,261 @@ mod test {
         assert_eq!(Err(TestError), rx.recv().now_or_never().unwrap().unwrap());
 
         assert_eq!(None, rx.recv().now_or_never().unwrap());
+    }
+
+    #[tokio::test]
+    async fn send_yields() {
+        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, TestError>>();
+        let (_, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let handle = tokio::task::spawn(async move {
+            let first = rx.recv().await;
+
+            assert_eq!(
+                "Hello",
+                String::from_utf8(first.unwrap().expect("recv failed"),).expect("Parse failed"),
+            );
+
+            // Because the first send yielded to this task, the second one has not send yet
+            assert_eq!(None, rx.recv().now_or_never());
+
+            let second = rx.recv().await;
+
+            assert_eq!(
+                "world",
+                String::from_utf8(second.unwrap().expect("recv failed"),).expect("Parse failed"),
+            );
+        });
+
+        let behaviour = send::<String, TestError>("Hello".to_owned())
+            .then(send::<String, TestError>("world".to_owned()));
+
+        let x = join!(handle, behaviour(&mut tx, &mut out_rx));
+
+        assert!(x.0.is_ok());
+    }
+
+    #[tokio::test]
+    async fn send_data_sends() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Result<Vec<u8>, TestError>>();
+
+        send_data(&tx, b"1".to_vec());
+
+        assert_eq!(
+            b"1".to_vec(),
+            rx.recv()
+                .await
+                .expect("Should be Some")
+                .expect("Should be ok")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_expectations_executes_behaviour() {
+        let called = Arc::new(AtomicBool::new(false));
+
+        let session_factory = |_: InReceiver<TestError>, _: OutSender| async { Ok(()) }.boxed();
+        let client_behaviour = into_behaviour({
+            let called = called.clone();
+            |_, _| async move { called.store(true, Ordering::Release) }.boxed()
+        });
+
+        assert_behaviour(session_factory, client_behaviour).await;
+
+        assert_eq!(true, called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_expectations_starts_session() {
+        let called = Arc::new(AtomicBool::new(false));
+
+        let session_factory = {
+            let called = called.clone();
+            |_: InReceiver<TestError>, _: OutSender| {
+                async move { Ok(called.store(true, Ordering::Release)) }.boxed()
+            }
+        };
+        let client_behaviour = into_behaviour(|_, _| async {}.boxed());
+
+        assert_behaviour(session_factory, client_behaviour).await;
+
+        assert_eq!(true, called.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_expectations_sends_in_to_session() {
+        let session_factory = {
+            |mut receiver: InReceiver<TestError>, _: OutSender| {
+                async move {
+                    match receiver.recv().await {
+                        Some(Ok(x)) if x == vec![42u8] => Ok(()),
+                        _ => Err(TestError),
+                    }
+                }
+                .boxed()
+            }
+        };
+        let client_behaviour = into_behaviour(|in_sender, _| {
+            async move {
+                in_sender.send(Ok(vec![42u8])).expect("Send failed");
+            }
+            .boxed()
+        });
+
+        assert_behaviour(session_factory, client_behaviour).await;
+    }
+
+    #[tokio::test]
+    async fn test_expectations_receives_out_from_session() {
+        let session_factory = {
+            |_, sender: OutSender| {
+                async move { sender.send(vec![42u8]).map_err(|_| TestError) }.boxed()
+            }
+        };
+        let client_behaviour =
+            into_behaviour::<TestError, _>(|_, out_receiver: &mut OutReceiver| {
+                async move {
+                    assert!(matches!(out_receiver.recv().await, Some(x) if x == vec![42u8]));
+                }
+                .boxed()
+            });
+
+        assert_behaviour(session_factory, client_behaviour).await;
+    }
+
+    fn assert_unwind_safe<O, F: Future<Output = O>>(
+        future: F,
+    ) -> impl Future<Output = Result<O, Box<dyn Any + std::marker::Send>>> {
+        panic::set_hook(Box::new(|_info| {
+            // do nothing
+        }));
+
+        AssertUnwindSafe(future).catch_unwind()
+    }
+
+    async fn assert_beaviour_test_result<
+        E: ErrorType,
+        F: SessionFactory<E> + 'static,
+        B: BehaviourFunction<E> + 'static,
+    >(
+        session_factory: F,
+        behaviour: B,
+        expect_err: bool,
+    ) {
+        panic::set_hook(Box::new(|_info| {
+            // do nothing
+        }));
+        let result = assert_unwind_safe(assert_behaviour(session_factory, behaviour)).await;
+
+        assert_eq!(expect_err, result.is_err());
+    }
+
+    async fn assert_beaviour_test_fails<
+        E: ErrorType,
+        F: SessionFactory<E> + 'static,
+        B: BehaviourFunction<E> + 'static,
+    >(
+        session_factory: F,
+        behaviour: B,
+    ) {
+        assert_beaviour_test_result(session_factory, behaviour, true).await;
+    }
+
+    async fn assert_beaviour_test_succeeds<
+        E: ErrorType,
+        F: SessionFactory<E> + 'static,
+        B: BehaviourFunction<E> + 'static,
+    >(
+        session_factory: F,
+        behaviour: B,
+    ) {
+        assert_beaviour_test_result(session_factory, behaviour, false).await;
+    }
+
+    #[tokio::test]
+    async fn test_expectations_fails_if_error_in_session() {
+        let session_factory = { |_, _| async move { Err(TestError) }.boxed() };
+        let client_behaviour = into_behaviour::<TestError, _>(|_, _| async move {}.boxed());
+
+        assert_beaviour_test_fails(session_factory, client_behaviour).await;
+    }
+
+    #[tokio::test]
+    async fn test_expectations_fails_if_error_in_behaviour() {
+        let session_factory = |_, _| async move { Ok(()) }.boxed();
+        let client_behaviour = into_behaviour::<TestError, _>(|_, _| {
+            async move {
+                assert!(false);
+            }
+            .boxed()
+        });
+
+        assert_beaviour_test_fails(session_factory, client_behaviour).await;
+    }
+
+    #[tokio::test]
+    async fn test_expectations_succeeds_if_empty() {
+        let session_factory = |_, _| async move { Ok(()) }.boxed();
+        let client_behaviour = into_behaviour::<TestError, _>(|_, _| async move {}.boxed());
+
+        assert_beaviour_test_succeeds(session_factory, client_behaviour).await;
+    }
+
+    #[tokio::test]
+    async fn assert_receive_fails_if_no_message() {
+        let (_, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let result = assert_unwind_safe(async { assert_receive(&mut out_rx, |_| true) }).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn assert_receive_succeeds_if_message_matches() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        out_tx.send(vec![0u8]).expect("Should succeed");
+        let result = assert_unwind_safe(async { assert_receive(&mut out_rx, |_| true) }).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn assert_receive_succeeds_if_session_closed() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        out_tx.send(vec![0u8]).expect("Should succeed");
+        out_rx.close();
+
+        let result = assert_unwind_safe(async { assert_receive(&mut out_rx, |_| true) }).await;
+
+        assert!(result.is_ok());
+
+        let result = assert_unwind_safe(async { assert_receive(&mut out_rx, |_| true) }).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn assert_receive_fails_if_predicate_false() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        out_tx.send(vec![0u8]).expect("Should succeed");
+
+        let result = assert_unwind_safe(async { assert_receive(&mut out_rx, |_| false) }).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn assert_receive_passes_message_to_predicate() {
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        out_tx.send(vec![0u8]).expect("Should succeed");
+
+        let result =
+            assert_unwind_safe(async { assert_receive(&mut out_rx, |data| data == vec![0u8]) })
+                .await;
+
+        assert!(result.is_ok());
     }
 }
