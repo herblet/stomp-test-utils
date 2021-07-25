@@ -80,6 +80,7 @@ impl<E: ErrorType, T: BehaviourFunction<E> + 'static> Chainable<E> for T {
     }
 }
 
+/// Help the compiler to assign appropriate lifetimes to inputs and outputs of BehaviourFunction-equivalent closure.
 fn into_behaviour<E, C>(closure: C) -> impl BehaviourFunction<E>
 where
     E: ErrorType,
@@ -93,11 +94,7 @@ where
     closure
 }
 
-pub fn send<
-    E: ErrorType,
-    E2: Into<E> + ErrorType,
-    T: TryInto<Vec<u8>, Error = E2> + Send + 'static,
->(
+pub fn send<T: TryInto<Vec<u8>> + Send + 'static, E: ErrorType + From<T::Error>>(
     data: T,
 ) -> impl BehaviourFunction<E> {
     into_behaviour(move |in_sender: &mut InSender<E>, _: &mut OutReceiver| {
@@ -106,7 +103,7 @@ pub fn send<
     })
 }
 
-pub fn send_data<E: ErrorType, E2: Into<E>, T: TryInto<Vec<u8>, Error = E2>>(
+pub fn send_data<T: TryInto<Vec<u8>>, E: ErrorType + From<T::Error>>(
     in_sender: &InSender<E>,
     data: T,
 ) {
@@ -187,4 +184,136 @@ pub fn wait_for_disconnect<'a, E: ErrorType>(
         ()
     }
     .boxed()
+}
+
+#[cfg(test)]
+mod test {
+
+    use std::convert::Infallible;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn chaining_works() {
+        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let behaviour_a = into_behaviour(|sender: &mut InSender<()>, _: &mut OutReceiver| {
+            async move {
+                sender.send(Ok(b"foo".to_vec())).expect("Send failed");
+                ()
+            }
+            .boxed()
+        });
+
+        let behaviour_b = into_behaviour(|sender: &mut InSender<()>, _: &mut OutReceiver| {
+            async move {
+                sender.send(Ok(b"bar".to_vec())).expect("Send failed");
+                ()
+            }
+            .boxed()
+        });
+
+        // a then b...
+        behaviour_a.then(behaviour_b)(&mut tx, &mut out_rx).await;
+
+        // ... then close the channel
+        drop(tx);
+
+        assert_eq!(
+            "foo",
+            String::from_utf8(
+                rx.recv()
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+                    .expect("recv failed"),
+            )
+            .expect("Parse failed"),
+        );
+        assert_eq!(
+            "bar",
+            String::from_utf8(
+                rx.recv()
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+                    .expect("recv failed"),
+            )
+            .expect("Parse failed"),
+        );
+
+        assert_eq!(None, rx.recv().now_or_never().unwrap());
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestError;
+
+    impl From<Infallible> for TestError {
+        fn from(_: Infallible) -> Self {
+            TestError
+        }
+    }
+
+    #[tokio::test]
+    async fn send_works() {
+        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let behaviour = send::<String, TestError>("Hello".to_owned());
+
+        behaviour(&mut tx, &mut out_rx);
+
+        // ... then close the channel
+        drop(tx);
+
+        assert_eq!(
+            "Hello",
+            String::from_utf8(
+                rx.recv()
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap()
+                    .expect("recv failed"),
+            )
+            .expect("Parse failed"),
+        );
+
+        assert_eq!(None, rx.recv().now_or_never().unwrap());
+    }
+
+    struct TestData;
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TestError2;
+
+    impl From<TestError2> for TestError {
+        fn from(_: TestError2) -> Self {
+            TestError
+        }
+    }
+    impl TryInto<Vec<u8>> for TestData {
+        type Error = TestError2;
+
+        fn try_into(self) -> Result<Vec<u8>, Self::Error> {
+            Err(TestError2)
+        }
+    }
+
+    #[tokio::test]
+    async fn send_handles_conversion_error() {
+        let (mut tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (_, mut out_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let behaviour = send::<TestData, TestError>(TestData);
+
+        behaviour(&mut tx, &mut out_rx);
+
+        // ... then close the channel
+        drop(tx);
+
+        assert_eq!(Err(TestError), rx.recv().now_or_never().unwrap().unwrap());
+
+        assert_eq!(None, rx.recv().now_or_never().unwrap());
+    }
 }
