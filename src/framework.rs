@@ -120,8 +120,8 @@ pub async fn assert_behaviour<
 
     let results = join(session_future, other_future).await;
 
-    assert!(results.0.is_ok());
-    assert!(results.1.is_ok());
+    results.0.expect("Session returned error");
+    results.1.expect("Behaviour returned error");
 }
 
 /// Returns a [`BehaviourFuntion`] which sends the provided `data`, and then yields.
