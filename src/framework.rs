@@ -78,7 +78,7 @@ impl<E: ErrorType, T: BehaviourFunction<E> + 'static> Chainable<E> for T {
 }
 
 /// Help the compiler to assign appropriate lifetimes to inputs and outputs of BehaviourFunction-equivalent closure.
-fn into_behaviour<E, C>(closure: C) -> impl BehaviourFunction<E>
+pub fn into_behaviour<E, C>(closure: C) -> impl BehaviourFunction<E>
 where
     E: ErrorType,
     C: for<'a> FnOnce(
@@ -163,7 +163,11 @@ pub fn receive<E: ErrorType, T: FnOnce(Vec<u8>) -> bool + Send + 'static>(
     predicate: T,
 ) -> impl BehaviourFunction<E> {
     into_behaviour(|_: &mut InSender<E>, out_receiver: &mut OutReceiver| {
-        async move { assert_receive(out_receiver, predicate) }.boxed()
+        async move {
+            yield_now().await;
+            assert_receive(out_receiver, predicate)
+        }
+        .boxed()
     })
 }
 
