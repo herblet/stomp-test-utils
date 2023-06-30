@@ -125,7 +125,7 @@ pub async fn assert_behaviour<
 }
 
 /// Returns a [`BehaviourFuntion`] which sends the provided `data`, and then yields.
-pub fn send<T: TryInto<Vec<u8>> + Send + 'static, E: ErrorType + From<T::Error>>(
+pub fn send<T: Into<Vec<u8>> + Send + 'static, E: ErrorType>(
     data: T,
 ) -> impl BehaviourFunction<E> {
     into_behaviour(move |in_sender: &mut InSender<E>, _: &mut OutReceiver| {
@@ -136,12 +136,12 @@ pub fn send<T: TryInto<Vec<u8>> + Send + 'static, E: ErrorType + From<T::Error>>
 
 /// Sends `data` via `sender`, after converting it to bytes and transforming any error using `from`. Panics
 /// it the send fails.
-pub fn send_data<T: TryInto<Vec<u8>>, E: ErrorType + From<T::Error>>(
+pub fn send_data<T: Into<Vec<u8>>, E: ErrorType>(
     sender: &InSender<E>,
     data: T,
 ) {
     sender
-        .send(data.try_into().map_err(E::from))
+        .send(Ok(data.into()))
         .expect("Send failed");
 }
 
@@ -309,11 +309,10 @@ mod test {
             TestError
         }
     }
-    impl TryInto<Vec<u8>> for TestData {
-        type Error = TestError2;
-
-        fn try_into(self) -> Result<Vec<u8>, Self::Error> {
-            Err(TestError2)
+    impl Into<Vec<u8>> for TestData {
+        
+        fn into(self) -> Vec<u8> {
+            vec![]
         }
     }
 
